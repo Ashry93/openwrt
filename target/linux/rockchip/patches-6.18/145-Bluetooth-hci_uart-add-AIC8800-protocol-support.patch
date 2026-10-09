@@ -1,0 +1,333 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abdalla Ashry <abdallah.ashry@hotmail.com>
+Date: Fri, 09 Oct 2026 12:00:00 +0200
+Subject: [PATCH] Bluetooth: hci_uart: add AIC8800 protocol support
+
+Port the AIC8800 serdev H4 driver from the FriendlyElec vendor kernel
+(nanopi6-v6.1.y) used by the NanoPi R28S. The controller firmware is
+loaded over SDIO by the out-of-tree aic8800 WiFi driver, so the
+protocol only waits for CTS, requests aic8800_fdrv and then talks
+plain H4 at 1.5 Mbaud with hardware flow control.
+
+Adapted to v6.18: protocol id 12 is taken by HCI_UART_AML, and
+h4_recv_buf() now takes the struct hci_uart.
+
+Signed-off-by: Abdalla Ashry <abdallah.ashry@hotmail.com>
+---
+--- /dev/null
++++ b/drivers/bluetooth/hci_aic.c
+@@ -0,0 +1,236 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Bluetooth HCI UART driver for aic8800 devices
++ *
++ *  Copyright (c) 2026 FriendlyElec Computer Tech. Co., Ltd.
++ *  (http://www.friendlyelec.com)
++ *
++ * Based on hci_mrvl.c
++ *
++ *  Copyright (C) 2016  Marvell International Ltd.
++ *  Copyright (C) 2016  Intel Corporation
++ */
++
++#include <linux/kernel.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/skbuff.h>
++#include <linux/gpio/consumer.h>
++#include <linux/module.h>
++#include <linux/tty.h>
++#include <linux/of.h>
++#include <linux/serdev.h>
++
++#include <net/bluetooth/bluetooth.h>
++#include <net/bluetooth/hci_core.h>
++
++#include "hci_uart.h"
++
++struct aic_serdev {
++	struct hci_uart hu;
++
++	struct sk_buff *rx_skb;
++	struct sk_buff_head txq;
++};
++
++static int aic_open(struct hci_uart *hu)
++{
++	struct aic_serdev *aic = hu->priv;
++
++	BT_DBG("hu %p", hu);
++
++	if (!hci_uart_has_flow_control(hu))
++		return -EOPNOTSUPP;
++
++	skb_queue_head_init(&aic->txq);
++
++	return 0;
++}
++
++static int aic_close(struct hci_uart *hu)
++{
++	struct aic_serdev *aic = hu->priv;
++
++	BT_DBG("hu %p", hu);
++
++	skb_queue_purge(&aic->txq);
++	kfree_skb(aic->rx_skb);
++
++	return 0;
++}
++
++static int aic_flush(struct hci_uart *hu)
++{
++	struct aic_serdev *aic = hu->priv;
++
++	BT_DBG("hu %p", hu);
++
++	skb_queue_purge(&aic->txq);
++
++	return 0;
++}
++
++static int aic_enqueue(struct hci_uart *hu, struct sk_buff *skb)
++{
++	struct aic_serdev *aic = hu->priv;
++
++	BT_DBG("hu %p skb %p", hu, skb);
++
++	/* Prepend skb with frame type */
++	memcpy(skb_push(skb, 1), &hci_skb_pkt_type(skb), 1);
++	skb_queue_tail(&aic->txq, skb);
++
++	return 0;
++}
++
++static struct sk_buff *aic_dequeue(struct hci_uart *hu)
++{
++	struct aic_serdev *aic = hu->priv;
++
++	return skb_dequeue(&aic->txq);
++}
++
++static const struct h4_recv_pkt aic_recv_pkts[] = {
++	{ H4_RECV_ACL,   .recv = hci_recv_frame },
++	{ H4_RECV_SCO,   .recv = hci_recv_frame },
++	{ H4_RECV_EVENT, .recv = hci_recv_frame },
++	{ H4_RECV_ISO,   .recv = hci_recv_frame },
++};
++
++static int aic_recv(struct hci_uart *hu, const void *data, int count)
++{
++	struct aic_serdev *aic = hu->priv;
++
++	if (!test_bit(HCI_UART_REGISTERED, &hu->flags))
++		return -EUNATCH;
++
++	aic->rx_skb = h4_recv_buf(hu, aic->rx_skb, data, count,
++				  aic_recv_pkts,
++				  ARRAY_SIZE(aic_recv_pkts));
++	if (IS_ERR(aic->rx_skb)) {
++		int err = PTR_ERR(aic->rx_skb);
++		bt_dev_err(hu->hdev, "Frame reassembly failed (%d)", err);
++		aic->rx_skb = NULL;
++		return err;
++	}
++
++	return count;
++}
++
++static int aic_read_info(struct hci_dev *hdev)
++{
++	struct sk_buff *skb;
++
++	skb = __hci_cmd_sync(hdev, HCI_OP_READ_LOCAL_NAME, 0, NULL,
++			     HCI_INIT_TIMEOUT);
++	if (IS_ERR(skb)) {
++		bt_dev_err(hdev, "Read local name failed (%ld)", PTR_ERR(skb));
++		return PTR_ERR(skb);
++	}
++
++	if (skb->len != sizeof(struct hci_rp_read_local_name)) {
++		bt_dev_err(hdev, "Local name length mismatch");
++		kfree_skb(skb);
++		return -EIO;
++	}
++
++	bt_dev_info(hdev, "%s", (char *)(skb->data + 1));
++	kfree_skb(skb);
++
++	return 0;
++}
++
++static int aic_setup(struct hci_uart *hu)
++{
++	int err;
++
++	/* Detect the bluetooth module */
++	err = serdev_device_wait_for_cts(hu->serdev, true, 500);
++	if (err) {
++		bt_dev_err(hu->hdev, "Wait for CTS failed with %d", err);
++		return err;
++	}
++
++	/* Request the Wifi driver to load firmware over SDIO */
++	err = request_module("aic8800_fdrv");
++	if (err) {
++		bt_dev_err(hu->hdev, "request_module failed: %d", err);
++		return err;
++	}
++
++	/* Wait for firmware to become ready */
++	msleep(100);
++
++	err = aic_read_info(hu->hdev);
++	if (err)
++		return err;
++
++	return 0;
++}
++
++static const struct hci_uart_proto aic_proto = {
++	.id		= HCI_UART_AIC,
++	.name		= "AIC (H4)",
++	.init_speed	= 1500000,
++	.open		= aic_open,
++	.close		= aic_close,
++	.flush		= aic_flush,
++	.setup		= aic_setup,
++	.recv		= aic_recv,
++	.enqueue	= aic_enqueue,
++	.dequeue	= aic_dequeue,
++};
++
++static int aic_serdev_probe(struct serdev_device *serdev)
++{
++	struct device *dev = &serdev->dev;
++	struct aic_serdev *aicdev;
++
++	aicdev = devm_kzalloc(dev, sizeof(*aicdev), GFP_KERNEL);
++	if (!aicdev)
++		return -ENOMEM;
++
++	aicdev->hu.priv = aicdev;
++	aicdev->hu.serdev = serdev;
++	serdev_device_set_drvdata(serdev, aicdev);
++
++	return hci_uart_register_device(&aicdev->hu, &aic_proto);
++}
++
++static void aic_serdev_remove(struct serdev_device *serdev)
++{
++	struct aic_serdev *aicdev = serdev_device_get_drvdata(serdev);
++
++	hci_uart_unregister_device(&aicdev->hu);
++}
++
++#ifdef CONFIG_OF
++static const struct of_device_id aic_bluetooth_of_match[] = {
++	{ .compatible = "cvte,aic8800-bt" },
++	{ },
++};
++MODULE_DEVICE_TABLE(of, aic_bluetooth_of_match);
++#endif
++
++static struct serdev_device_driver aic_serdev_driver = {
++	.probe = aic_serdev_probe,
++	.remove = aic_serdev_remove,
++	.driver = {
++		.name = "hci_uart_aic",
++		.of_match_table = of_match_ptr(aic_bluetooth_of_match),
++	},
++};
++
++int __init aic_init(void)
++{
++	serdev_device_driver_register(&aic_serdev_driver);
++
++	return hci_uart_register_proto(&aic_proto);
++}
++
++int __exit aic_deinit(void)
++{
++	serdev_device_driver_unregister(&aic_serdev_driver);
++
++	return hci_uart_unregister_proto(&aic_proto);
++}
+--- a/drivers/bluetooth/hci_ldisc.c
++++ b/drivers/bluetooth/hci_ldisc.c
+@@ -926,6 +926,9 @@ static int __init hci_uart_init(void)
+ #ifdef CONFIG_BT_HCIUART_AML
+ 	aml_init();
+ #endif
++#ifdef CONFIG_BT_HCIUART_AIC
++	aic_init();
++#endif
+ 	return 0;
+ }
+ 
+@@ -964,6 +967,9 @@ static void __exit hci_uart_exit(void)
+ #ifdef CONFIG_BT_HCIUART_AML
+ 	aml_deinit();
+ #endif
++#ifdef CONFIG_BT_HCIUART_AIC
++	aic_deinit();
++#endif
+ 	tty_unregister_ldisc(&hci_uart_ldisc);
+ }
+ 
+--- a/drivers/bluetooth/hci_uart.h
++++ b/drivers/bluetooth/hci_uart.h
+@@ -20,7 +20,7 @@
+ #define HCIUARTGETFLAGS		_IOR('U', 204, int)
+ 
+ /* UART protocols */
+-#define HCI_UART_MAX_PROTO	13
++#define HCI_UART_MAX_PROTO	14
+ 
+ #define HCI_UART_H4	0
+ #define HCI_UART_BCSP	1
+@@ -35,6 +35,7 @@
+ #define HCI_UART_NOKIA	10
+ #define HCI_UART_MRVL	11
+ #define HCI_UART_AML	12
++#define HCI_UART_AIC	13
+ 
+ #define HCI_UART_RAW_DEVICE	0
+ #define HCI_UART_RESET_ON_INIT	1
+@@ -216,3 +217,8 @@ int mrvl_deinit(void);
+ int aml_init(void);
+ int aml_deinit(void);
+ #endif
++
++#ifdef CONFIG_BT_HCIUART_AIC
++int aic_init(void);
++int aic_deinit(void);
++#endif
+--- a/drivers/bluetooth/Kconfig
++++ b/drivers/bluetooth/Kconfig
+@@ -286,6 +286,17 @@ config BT_HCIUART_AML
+ 
+ 	  Say Y here to compile support for HCI AML protocol.
+ 
++config BT_HCIUART_AIC
++	bool "AIC H4 protocol support"
++	depends on BT_HCIUART
++	depends on BT_HCIUART_SERDEV
++	select BT_HCIUART_H4
++	help
++	  This is a simple H4 protocol based on the Marvell protocol for the
++	  AIC8800 Bluetooth controller to replace use of hciattach any.
++
++	  Say Y here to compile support for HCI AIC protocol.
++
+ config BT_HCIBCM203X
+ 	tristate "HCI BCM203x USB driver"
+ 	depends on USB
+--- a/drivers/bluetooth/Makefile
++++ b/drivers/bluetooth/Makefile
+@@ -52,4 +52,5 @@ hci_uart-$(CONFIG_BT_HCIUART_QCA)	+= hci
+ hci_uart-$(CONFIG_BT_HCIUART_AG6XX)	+= hci_ag6xx.o
+ hci_uart-$(CONFIG_BT_HCIUART_MRVL)	+= hci_mrvl.o
+ hci_uart-$(CONFIG_BT_HCIUART_AML)	+= hci_aml.o
++hci_uart-$(CONFIG_BT_HCIUART_AIC)	+= hci_aic.o
+ hci_uart-objs				:= $(hci_uart-y)

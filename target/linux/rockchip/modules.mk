@@ -216,3 +216,18 @@ define KernelPackage/rockchip-dfi
 endef
 
 $(eval $(call KernelPackage,rockchip-dfi))
+
+
+define KernelPackage/hci-uart-aic
+  SUBMENU:=$(BLUETOOTH_MENU)
+  TITLE:=AIC8800 Bluetooth HCI UART protocol
+  DEPENDS:=@TARGET_rockchip @!AIC8800_SDIO_BT_SUPPORT +kmod-hci-uart
+  KCONFIG:=CONFIG_BT_HCIUART_AIC=y
+endef
+
+define KernelPackage/hci-uart-aic/description
+  Built into hci_uart.ko. The controller firmware is loaded over SDIO
+  by the aic8800 WiFi driver (kmod-aic8800-sdio).
+endef
+
+$(eval $(call KernelPackage,hci-uart-aic))
