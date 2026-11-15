@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abdalla Ashry <abdallah.ashry@hotmail.com>
+Date: Sat, 14 Nov 2026 12:00:00 +0200
+Subject: [PATCH] arm64: dts: rockchip: fix VCCIO4 supply on NanoPi R2S
+
+The VCCIO4 domain (GMAC RGMII-M1 pins) is powered from VDD_PHY_IO,
+which is fed by the 3.3 V VCC_IO rail on both the NanoPi R2S and the
+R2S Plus (the optional 2.5 V LDO is not populated). The schematics
+and the FriendlyElec vendor device tree agree. Declaring 1.8 V puts
+the pads in 1.8 V mode on a 3.3 V rail, so point vccio4-supply at
+vcc_io_33.
+
+Signed-off-by: Abdalla Ashry <abdallah.ashry@hotmail.com>
+---
+--- a/arch/arm64/boot/dts/rockchip/rk3328-nanopi-r2s.dts
++++ b/arch/arm64/boot/dts/rockchip/rk3328-nanopi-r2s.dts
+@@ -299,7 +299,7 @@
+ 	vccio1-supply = <&vcc_io_33>;
+ 	vccio2-supply = <&vcc18_emmc>;
+ 	vccio3-supply = <&vcc_io_sdio>;
+-	vccio4-supply = <&vcc_18>;
++	vccio4-supply = <&vcc_io_33>;
+ 	vccio5-supply = <&vcc_io_33>;
+ 	vccio6-supply = <&vcc_io_33>;
+ 	status = "okay";
