@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abdalla Ashry <abdallah.ashry@hotmail.com>
+Date: Sat, 14 Nov 2026 12:00:00 +0200
+Subject: [PATCH] arm64: dts: rockchip: enable SDIO Wi-Fi on NanoPi R2S Plus
+
+The NanoPi R2S Plus has an M.2 E-key slot for an optional SDIO Wi-Fi
+module (FriendlyElec ships an RTL8822CS). It is wired to the sdmmc_ext
+controller on GPIO3_A0..A7, with WL_REG_ON on GPIO3_B0 and the RK805
+32 kHz clock on SUSCLK.
+
+Per the R2S Plus schematic (sheet 6) the GPIO3_A/B pins are in the
+VCCIO6 domain, which is supplied by VCC_18, so override vccio6-supply
+and use 1.8 V signalling for the slot. Pin drive strength follows the
+vendor device tree.
+
+This is kept out of the NanoPi R2S device tree: there VCCIO6 is
+supplied by VCC_IO (3.3 V) and GPIO3_A4/A6 are routed to UART1 on the
+GPIO header.
+
+Signed-off-by: Abdalla Ashry <abdallah.ashry@hotmail.com>
+---
+--- a/arch/arm64/boot/dts/rockchip/rk3328-nanopi-r2s-plus.dts
++++ b/arch/arm64/boot/dts/rockchip/rk3328-nanopi-r2s-plus.dts
+@@ -15,6 +15,16 @@
+ 
+ 	aliases {
+ 		mmc1 = &emmc;
++		mmc2 = &sdmmc_ext;
++	};
++
++	sdio_pwrseq: sdio-pwrseq {
++		compatible = "mmc-pwrseq-simple";
++		clocks = <&rk805 1>;
++		clock-names = "ext_clock";
++		pinctrl-0 = <&wifi_enable_h>;
++		pinctrl-names = "default";
++		reset-gpios = <&gpio3 RK_PB0 GPIO_ACTIVE_LOW>;
+ 	};
+ };
+ 
+@@ -28,3 +38,50 @@
+ 	pinctrl-0 = <&emmc_clk &emmc_cmd &emmc_bus8>;
+ 	status = "okay";
+ };
++
++/* M.2 SDIO Wi-Fi slot, GPIO3_A/B are in the 1.8 V VCCIO6 domain */
++&io_domains {
++	vccio6-supply = <&vcc_18>;
++};
++
++&pinctrl {
++	sdio-pwrseq {
++		wifi_enable_h: wifi-enable-h {
++			rockchip,pins = <3 RK_PB0 RK_FUNC_GPIO &pcfg_pull_none>;
++		};
++	};
++};
++
++&sdmmc_ext {
++	bus-width = <4>;
++	cap-sd-highspeed;
++	cap-sdio-irq;
++	keep-power-in-suspend;
++	max-frequency = <50000000>;
++	mmc-pwrseq = <&sdio_pwrseq>;
++	no-mmc;
++	no-sd;
++	non-removable;
++	pinctrl-0 = <&sdmmc0ext_clk>, <&sdmmc0ext_cmd>, <&sdmmc0ext_bus4>;
++	pinctrl-names = "default";
++	rockchip,default-sample-phase = <120>;
++	vmmc-supply = <&vcc_io_33>;
++	vqmmc-supply = <&vcc_18>;
++	status = "okay";
++};
++
++&sdmmc0ext_bus4 {
++	rockchip,pins =
++		<3 RK_PA4 3 &pcfg_pull_up_8ma>,
++		<3 RK_PA5 3 &pcfg_pull_up_8ma>,
++		<3 RK_PA6 3 &pcfg_pull_up_8ma>,
++		<3 RK_PA7 3 &pcfg_pull_up_8ma>;
++};
++
++&sdmmc0ext_clk {
++	rockchip,pins = <3 RK_PA2 3 &pcfg_pull_none_8ma>;
++};
++
++&sdmmc0ext_cmd {
++	rockchip,pins = <3 RK_PA0 3 &pcfg_pull_up_8ma>;
++};
